@@ -1,0 +1,26 @@
+services:
+  docker-stack-dashboard:
+    build: .
+    container_name: docker-stack-dashboard
+    restart: unless-stopped
+    user: "0:0"
+    environment:
+      NETWORK: ai-stack
+      HOST_GATEWAY: host.docker.internal
+      DOCKER_HOST: unix:///var/run/docker.sock
+      TIMEOUT: "5"
+    ports:
+      - "8088:8088"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ai-stack
+      - mcp-network
+
+networks:
+  ai-stack:
+    external: true
+  mcp-network:
+    external: true
