@@ -127,6 +127,11 @@ def _upgrade_reachable(result):
 def _sse_result(source, url, method, started, code, stdout, stderr):
     body = (stdout or "").strip()
     event_seen = body.startswith("event:") or "\nevent:" in body
+    if event_seen and code is None:
+        # The early-exit pipeline intentionally stops curl before its trailing
+        # -w status formatter could run. A valid MCP endpoint event is itself
+        # sufficient evidence of a successful HTTP SSE connection.
+        code = 200
     reachable = event_seen or code in _REACHABLE_PROTOCOL_CODES or (code is not None and 200 <= code < 400)
     return {
         "source": source,
@@ -137,7 +142,7 @@ def _sse_result(source, url, method, started, code, stdout, stderr):
         "reachable": bool(reachable),
         "exit": 0 if event_seen else 1,
         "ms": int((time.time() - started) * 1000),
-        "error": (stderr or "")[-700:],
+        "error": "" if event_seen else (stderr or "")[-700:],
         "sample": body[:1000],
     }
 
