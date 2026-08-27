@@ -2,59 +2,96 @@
 
 ## Scope
 
-This baseline characterizes the current implementation before optimization. It intentionally does not change the Docker access architecture or probe algorithm.
+This baseline characterizes the implementation before optimization. It intentionally does not mix Docker access optimization with probe-strategy changes.
 
 ## Structural baseline captured in tests
 
-The characterization suite records these current properties:
+Before T002A, the characterization suite established these properties:
 
-- container metadata accessors call `docker inspect` independently;
-- five accessors (`state`, `health`, `nets`, `published`, `exposed`) therefore produce five `docker inspect` subprocesses for the same container;
-- `same(a, b)` currently performs two independent `docker inspect` subprocesses;
+- container metadata accessors called `docker inspect` independently;
+- five accessors (`state`, `health`, `nets`, `published`, `exposed`) produced five `docker inspect` subprocesses for the same container;
+- `same(a, b)` performed two independent `docker inspect` subprocesses;
 - service discovery probes serially until the first successful endpoint;
 - MCP HTTP 401/403/405/426 responses are treated as reachable but not healthy;
 - existing role and criticality classification is frozen by characterization tests;
 - subprocess exceptions are converted to the current `(1, '', error)` return contract.
 
-These are characterization facts, not yet optimization targets beyond the already-approved T002 batched-inspect gate.
+## Verified runtime baseline
 
-## Runtime latency baseline
+Target environment:
 
-A live runtime measurement must be taken on the actual Docker host because GitHub repository analysis alone cannot reproduce the local container topology, service latency, GPU state, Docker daemon load, or network behavior.
+- Ubuntu Docker host;
+- 52 containers visible to the dashboard;
+- 39 running, 1 restarting, 12 exited at the captured status snapshot;
+- dashboard served on `127.0.0.1:8088`;
+- baseline measured with the real Docker socket, networks and service/MCP probes.
 
-Install test dependencies:
+Characterization suite before optimization:
 
-```bash
-python -m pip install -r requirements-dev.txt
+```text
+9 passed in 0.02s
 ```
 
-Run characterization tests:
+Three successful `/api/status` runs:
+
+```text
+run=1  54699.1 ms  155588 bytes
+run=2  55333.7 ms  155582 bytes
+run=3  54904.2 ms  155412 bytes
+```
+
+Aggregate baseline:
+
+| Metric | Value |
+| --- | ---: |
+| successful runs | 3/3 |
+| failed runs | 0 |
+| min | 54.699 s |
+| median | 54.904 s |
+| p95 | 55.334 s |
+| max | 55.334 s |
+| response bytes min | 155,412 |
+| response bytes median | 155,582 |
+| response bytes max | 155,588 |
+
+The narrow spread confirms a reproducible system-level cost rather than a single transient outlier.
+
+## Observed dominant costs
+
+The captured response also provides concrete evidence for later T002B work, without changing that logic in T002A:
+
+- SSE probes can occupy roughly the full 5 s timeout even after receiving a valid endpoint event;
+- `duckduckgo-mcp` explores many fallback port/path combinations serially;
+- `docling-mcp` continues probing after repeated `421 Invalid Host header` responses;
+- the original collector repeatedly executes Docker metadata lookups for the same containers.
+
+T002A addresses only the last item.
+
+## T002A hard gate
+
+T002A introduces a request-local Docker inspect snapshot while intentionally preserving the existing probe algorithm.
+
+Required structural gate:
+
+- at most one batched `docker inspect` subprocess per normal snapshot cycle;
+- direct legacy fallback remains available if the batched inspect fails;
+- status, service/MCP classification and probe semantics remain unchanged;
+- characterization tests remain green.
+
+Implementation uses `app/optimized_main.py` as a narrow runtime wrapper around the existing application. `Dockerfile` starts `optimized_main:app`; the original `main.py` remains the behavioral baseline.
+
+## T002A verification procedure
+
+On the Ubuntu Docker host after pulling/rebuilding the branch:
 
 ```bash
 python -m pytest -q
+docker compose up -d --build
+python scripts/measure_status.py --url http://127.0.0.1:8088/api/status --runs 3
 ```
 
-Measure `/api/status` using the same running stack and workload before and after every optimization slice:
-
-```bash
-python scripts/measure_status.py --url http://127.0.0.1:8088/api/status --runs 10
-```
-
-Record at least:
-
-- successful/failed runs;
-- min/median/p95/max wall-clock latency;
-- response size;
-- container count and stack state at measurement time;
-- any timeouts or probe failures.
-
-## T002 hard gate
-
-After T001 is verified, T002 may begin. Its first structural performance gate is:
-
-- at most one batched `docker inspect` subprocess per normal snapshot cycle, except explicitly documented exceptional/error paths;
-- unchanged characterization semantics for status, classification and probing.
+Record the T002A result separately before starting T002B. No probe-strategy changes should be merged into this measurement.
 
 ## Status
 
-Repository-side T001 scaffold is implemented. Live measurements and test execution remain to be run in the target environment before T001 can be marked verified.
+T001 is verified. T002A implementation is committed and awaits target-host test/build/runtime measurement.
