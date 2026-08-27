@@ -1,22 +1,10 @@
-# T001 Baseline
+# Performance Baseline and Optimization Measurements
 
 ## Scope
 
-This baseline characterizes the implementation before optimization. It intentionally does not mix Docker access optimization with probe-strategy changes.
+This document tracks measured performance on the real Ubuntu Docker host. Optimization slices are kept separate so each improvement can be attributed to one change set.
 
-## Structural baseline captured in tests
-
-Before T002A, the characterization suite established these properties:
-
-- container metadata accessors called `docker inspect` independently;
-- five accessors (`state`, `health`, `nets`, `published`, `exposed`) produced five `docker inspect` subprocesses for the same container;
-- `same(a, b)` performed two independent `docker inspect` subprocesses;
-- service discovery probes serially until the first successful endpoint;
-- MCP HTTP 401/403/405/426 responses are treated as reachable but not healthy;
-- existing role and criticality classification is frozen by characterization tests;
-- subprocess exceptions are converted to the current `(1, '', error)` return contract.
-
-## Verified runtime baseline
+## T001 — verified baseline
 
 Target environment:
 
@@ -24,7 +12,7 @@ Target environment:
 - 52 containers visible to the dashboard;
 - 39 running, 1 restarting, 12 exited at the captured status snapshot;
 - dashboard served on `127.0.0.1:8088`;
-- baseline measured with the real Docker socket, networks and service/MCP probes.
+- real Docker socket, networks and service/MCP probes.
 
 Characterization suite before optimization:
 
@@ -40,7 +28,7 @@ run=2  55333.7 ms  155582 bytes
 run=3  54904.2 ms  155412 bytes
 ```
 
-Aggregate baseline:
+Aggregate T001 baseline:
 
 | Metric | Value |
 | --- | ---: |
@@ -50,39 +38,75 @@ Aggregate baseline:
 | median | 54.904 s |
 | p95 | 55.334 s |
 | max | 55.334 s |
-| response bytes min | 155,412 |
 | response bytes median | 155,582 |
-| response bytes max | 155,588 |
 
-The narrow spread confirms a reproducible system-level cost rather than a single transient outlier.
+Structural characterization established that repeated metadata access caused many independent `docker inspect` subprocesses and that service/MCP discovery was serial.
 
-## Observed dominant costs
+## T002A — verified batched Docker inspect
 
-The captured response also provides concrete evidence for later T002B work, without changing that logic in T002A:
+T002A introduced a request-local Docker inspect snapshot through `app/optimized_main.py`. `Dockerfile` runs `optimized_main:app`; the original `main.py` remains the behavioral baseline.
 
-- SSE probes can occupy roughly the full 5 s timeout even after receiving a valid endpoint event;
-- `duckduckgo-mcp` explores many fallback port/path combinations serially;
-- `docling-mcp` continues probing after repeated `421 Invalid Host header` responses;
-- the original collector repeatedly executes Docker metadata lookups for the same containers.
+Measured three-run result on the same Docker host:
 
-T002A addresses only the last item.
+```text
+run=1  36978.8 ms  155574 bytes
+run=2  36696.0 ms  155562 bytes
+run=3  36672.6 ms  155410 bytes
+```
 
-## T002A hard gate
+Aggregate T002A:
 
-T002A introduces a request-local Docker inspect snapshot while intentionally preserving the existing probe algorithm.
+| Metric | T001 | T002A | Change |
+| --- | ---: | ---: | ---: |
+| min | 54.699 s | 36.673 s | -33.0% |
+| median | 54.904 s | 36.696 s | -33.2% |
+| p95 | 55.334 s | 36.979 s | -33.2% |
+| max | 55.334 s | 36.979 s | -33.2% |
+| response bytes median | 155,582 | 155,562 | effectively unchanged |
+| failed runs | 0/3 | 0/3 | unchanged |
 
-Required structural gate:
+Median wall-clock time improved by **18.208 s (-33.2%)**, roughly **1.50x faster**, while response size stayed effectively unchanged.
 
-- at most one batched `docker inspect` subprocess per normal snapshot cycle;
-- direct legacy fallback remains available if the batched inspect fails;
-- status, service/MCP classification and probe semantics remain unchanged;
-- characterization tests remain green.
+T002A hard gate is therefore verified:
 
-Implementation uses `app/optimized_main.py` as a narrow runtime wrapper around the existing application. `Dockerfile` starts `optimized_main:app`; the original `main.py` remains the behavioral baseline.
+- normal status collection uses one batched inspect snapshot;
+- legacy direct inspect remains as fallback if batch loading fails;
+- response generation remains successful on the real 52-container stack.
 
-## T002A verification procedure
+## Remaining observed cost after T002A
 
-On the Ubuntu Docker host after pulling/rebuilding the branch:
+The remaining ~36.7 s median is dominated by probe/discovery behavior rather than Docker metadata collection. The captured T001/T002A responses show concrete examples:
+
+- SSE endpoints can hold a valid connection until the 5 s curl timeout even after returning the first `event: endpoint` frame;
+- `duckduckgo-mcp` has no advertised HTTP port yet the legacy algorithm tries a broad generic port list and multiple MCP paths serially;
+- MCP responses such as `406 Not Acceptable` and `421 Invalid Host header` prove that an MCP endpoint is present, but legacy discovery continues until a later 405/timeout or exhausts additional probes;
+- known service ports are not always prioritized ahead of generic candidates.
+
+## T002B — bounded fast probe strategy
+
+T002B is implemented in `app/optimized_main.py` and deliberately leaves the original `main.py` unchanged.
+
+Changes:
+
+- known service-hint ports are tried first;
+- exposed/published Docker ports are used as evidence-based candidates;
+- no blind generic port scan is performed when a container advertises no ports;
+- legacy broad fallback scanning is opt-in with `DEEP_DISCOVERY=1`;
+- MCP HTTP 406 and 421 are treated as reachable protocol/configuration signals in addition to 401/403/405/426;
+- SSE curl uses `--no-buffer` and terminates after the first two event-frame lines using `head -n 2`, avoiding the normal streaming timeout once an endpoint event has arrived.
+
+### T002B performance gate
+
+Required target on the same host/topology:
+
+- median `/api/status` < **15 s**;
+- stretch goal < **5 s**;
+- no failed benchmark requests;
+- JSON response remains valid;
+- service/MCP detection remains the same or becomes more semantically correct (for example a 406/421 MCP response may now be classified as reachable instead of unknown);
+- characterization/performance tests remain green.
+
+Verification command:
 
 ```bash
 python -m pytest -q
@@ -90,8 +114,8 @@ docker compose up -d --build
 python scripts/measure_status.py --url http://127.0.0.1:8088/api/status --runs 3
 ```
 
-Record the T002A result separately before starting T002B. No probe-strategy changes should be merged into this measurement.
-
 ## Status
 
-T001 is verified. T002A implementation is committed and awaits target-host test/build/runtime measurement.
+- T001: verified.
+- T002A: verified, median 36.696 s, -33.2% vs T001.
+- T002B: implemented, awaiting target-host tests and runtime measurement.
