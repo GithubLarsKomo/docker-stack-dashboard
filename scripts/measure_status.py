@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Measure the current /api/status wall-clock baseline without extra dependencies."""
+"""Measure the current /api/status wall-clock baseline without extra dependencies.
+
+Local loopback measurements bypass environment-configured HTTP(S) proxies so
+corporate proxy settings cannot distort the baseline.
+"""
 
 import argparse
 import json
@@ -20,8 +24,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8088/api/status")
     parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     samples_ms = []
     sizes = []
@@ -30,7 +36,7 @@ def main():
     for i in range(args.runs):
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(args.url, timeout=args.timeout) as response:
+            with opener.open(args.url, timeout=args.timeout) as response:
                 body = response.read()
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 samples_ms.append(elapsed_ms)
