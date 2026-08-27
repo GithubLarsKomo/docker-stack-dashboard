@@ -26,12 +26,46 @@ def test_localcurl_treats_auth_and_method_codes_as_reachable(monkeypatch, dashbo
         assert result["http_code"] == code
 
 
+def test_t002b_treats_protocol_configuration_codes_as_reachable(monkeypatch, dashboard_module):
+    d = dashboard_module
+
+    for code in (406, 421):
+        monkeypatch.setattr(d, "run", lambda *args, _code=code, **kwargs: (0, f"body\nHTTP_CODE:{_code}", ""))
+        result = d.localcurl("http://service/mcp")
+        assert result["ok"] is False
+        assert result["reachable"] is True
+        assert result["http_code"] == code
+
+
 def test_localcurl_marks_successful_sse_as_ok(monkeypatch, dashboard_module):
     d = dashboard_module
-    monkeypatch.setattr(d, "run", lambda *args, **kwargs: (0, "event: endpoint\ndata: /message\nHTTP_CODE:200", ""))
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return 0, "event: endpoint\ndata: /message", ""
+
+    monkeypatch.setattr(d, "run", fake_run)
     result = d.localcurl("http://service/sse", sse=True)
     assert result["ok"] is True
     assert result["reachable"] is True
+    assert any("head -n 2" in part for part in calls[0])
+
+
+def test_t002b_does_not_blind_scan_unadvertised_ports(monkeypatch, dashboard_module):
+    d = dashboard_module
+    monkeypatch.setattr(d, "exposed", lambda n: [])
+    monkeypatch.setattr(d, "published", lambda n: {})
+
+    assert d.cand_ports("duckduckgo-mcp") == []
+
+
+def test_t002b_prioritizes_known_service_port(monkeypatch, dashboard_module):
+    d = dashboard_module
+    monkeypatch.setattr(d, "exposed", lambda n: [8080, 11434])
+    monkeypatch.setattr(d, "published", lambda n: {11434: [11434]})
+
+    assert d.cand_ports("ollama") == [11434, 8080]
 
 
 def test_mcp_discovery_preserves_reachable_handshake_semantics(monkeypatch, dashboard_module):
